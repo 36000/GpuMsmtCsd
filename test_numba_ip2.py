@@ -33,10 +33,10 @@ def test_ip2():
     m, n = A.shape
     nm2 = n+2*m
     shmem_num_elements = n+2*m+8*nm2
-    shmem_sz = shmem_num_elements*8
+    shmem_sz = shmem_num_elements*4
 
     parallel_qp_fit[
-        (1, 1, 1), 1,
+        (1, 1, 1), 32,
         0, shmem_sz](
             Rt, Q, A, b, N, x0, y0, l0, d, res)
 
