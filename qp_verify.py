@@ -1,6 +1,6 @@
 import numpy as np
 from scipy.optimize import minimize
-from numba_cls import prep_problem, batch_constrained_ls_fit
+from numba_ip2 import parallel_qp_fit
 
 def constrained_least_squares(R, d, A, b):
     """
@@ -66,6 +66,12 @@ def test_problems():
             "d": np.array([0, 0, 1]),
             "A": np.array([[1, 1], [-1, -1], [1, -1], [-1, 1]]),
             "b": np.array([1, -1, 0, 0])
+        },
+        {
+            "R": np.load("R.npy"),
+            "d": np.load("d.npy"),
+            "A": np.load("A.npy"),
+            "b": np.load("b.npy")
         }
     ]
 
@@ -77,20 +83,24 @@ def test_problems():
 
         # Print the results
         print("scipy solution x:", x)
-        print("A@x-b:", A@x-b)
+        print("A@x-b:", np.sum(A@x-b < 0))
         print("ls:", 1/2.*np.linalg.norm(R@x-d))
 
         coeff = np.zeros((1, 1, 1, R.shape[1]))
 
-        Rt, R_pinv, N_inv = prep_problem(R, A)
+        Q = R.T @ R
+        x0 = np.linalg.pinv(A) @ np.ones(A.shape[0])
 
-        x = batch_constrained_ls_fit[
-            (1, 1, 1), 1,
-            0, A.shape[1]*8](
-                Rt, R_pinv, N_inv, A, b, np.asarray([[[d]]]), coeff)
+        m, n = A.shape
+        sh_mem = 8*(3*n+6*m+n*n+6*n)
+
+        x = parallel_qp_fit[
+            (1, 1, 1), 32,
+            0, sh_mem](
+                -R.T, np.linalg.pinv(R), Q, A, b, x0, np.asarray([[[d]]]), coeff)
         x = coeff[0, 0, 0, :]
         print("Our solution x:", x)
-        print("A@x-b:", A@x-b)
+        print("A@x-b:", np.sum(A@x-b < 0))
         print("ls:", 1/2.*np.linalg.norm(R@x-d))
 
 # Run the test
