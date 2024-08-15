@@ -2,8 +2,6 @@ import numpy as np
 
 from numba import cuda, float64
 
-from scipy.linalg import cho_factor, cho_solve
-
 from dipy.reconst.mcsd import MSDeconvFit
 
 # GPU implementation of primal-dual Interior Point method
