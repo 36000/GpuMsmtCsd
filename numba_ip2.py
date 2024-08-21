@@ -1,4 +1,5 @@
 import numpy as np
+import math
 
 from scipy.optimize import minimize
 
@@ -10,7 +11,6 @@ from dipy.reconst.mcsd import MSDeconvFit
 # for convex quadratic constrained optimization (QP)
 # Specifically, ||Rx-d||_2 where Ax>=b
 # parallelized to solve 10s-100s of thousands of QPs
-# Given same R, A, b but different d (doesn't use this fact right now though)
 # ultimately used to fit MSMT CSD
 
 
@@ -22,10 +22,39 @@ tau=0.95
 
 
 @cuda.jit(max_registers=64)
-def parallel_qp_fit(Rt, R_pinv, G, A, b, x0, y0, l0, data, results,
+def parallel_qp_fit(Rt, R_pinv, G, A, b, x0, y0, l0, data, results, lt_ifx,
                     c, y, l, dx, dy, dl, rhs1, rhs2, Z, schur, cgr, cgp, cgAp):
     '''
-    Solves 1/2*x^t*Q*x+(Rt*d)^t*x given Ax>=0
+    Solves 1/2*x^t*G*x+(Rt*d)^t*x given Ax>=b
+    In MSMT, G, R, A, b are the same across voxels,
+    but there are different d for different voxels.
+    This fact is not used currently. So this is a more general
+    batched CLS QP solver.
+
+    Let:
+    c=(Rt*d)^t
+    L = diag(l)
+    Y = diag(y)
+    mu as centering parameter that tends to 0 with iteration number.
+
+    Set up with interior points, this is reformulated to:
+    | G  0 -A.T | |dx|   |0 |   | G*x-A.T*l+c |
+    | A -I  0   | |dy| = |0 | - | A*x-y-b     |
+    | 0  L  Y   | |dl|   |mu|   | YL          |
+
+    This reduces to:
+    |G -A.T| |dx| = | -G*x-A.T*l+c          |
+    |A Y\L | |dl|   | -(A*x-y-b) + (-y+mu/l)|
+    with dy = A*dx+(A*x-y-b)
+
+    Solving for dx, dl:
+    (G+A.T*(Y\L)*A)*dx = -G*x-A.T*l+c
+    dl = (Y\L)*(-(A*x-y-b) + (-y+mu/l) - A*dx)
+
+    So, the tricky part is solving for dx.
+    However, note that G+A.T*(Y\L)*A is hermitian positive semidefinite.
+    So, it can be solved using conjugate gradients.
+    This is done every iteration and is the longest part of the calculation.
     '''
     bx = cuda.blockIdx.x
     by = cuda.blockIdx.y
@@ -129,11 +158,13 @@ def parallel_qp_fit(Rt, R_pinv, G, A, b, x0, y0, l0, data, results,
         cuda.syncthreads()
 
         # dx = np.linalg.solve(G+A.T@np.diag(Z)@A, rhs1)
-        for i in block_range(n):
-            for j in range(n):
-                schur[j, i] = G[i, j] # note this is stored as its transpose for efficiency purposes
-                for k in range(m):
-                    schur[j, i] += A[k, i] * A[k, j] * Z[k]
+        for idx in block_range(lt_ifx.shape[0]):
+            i, j = lt_ifx[idx]
+            __tmp = G[j, i]
+            for k in range(m):
+                __tmp += A[k, i] * A[k, j] * Z[k]
+            schur[j, i] = __tmp
+            schur[i, j] = __tmp
         cuda.syncthreads()
 
         solved_inverse = cg(
@@ -165,12 +196,12 @@ def parallel_qp_fit(Rt, R_pinv, G, A, b, x0, y0, l0, data, results,
         beta = 1.0
         sigma = 1.0
         for ii in range(m):
-            if dy[ii] < 0:
-                sigma = min(sigma, -y[ii]/dy[ii])
-            if dl[ii] < 0:
-                beta = min(beta, -l[ii]/dl[ii])
-        beta = min(1.0, tau*beta)
-        sigma = min(1.0, tau*sigma)
+            if dy[ii] < 0 and dy[ii]*sigma < -y[ii]:
+                sigma = -y[ii]/dy[ii]
+            if dl[ii] < 0 and dl[ii]*beta < -l[ii]:
+                beta = -l[ii]/dl[ii]
+        beta *= tau
+        sigma *= tau
         alpha = min(beta, sigma)
 
         cuda.syncthreads()
@@ -204,6 +235,40 @@ def parallel_qp_fit(Rt, R_pinv, G, A, b, x0, y0, l0, data, results,
         x[ii] = 0
     cuda.syncthreads()
 
+# @cuda.jit(device=True, inline=True)
+# def cholesky_solve(A, b, x, L, n):
+#     for ii in block_range(n):
+#         for jj in range(n):
+#             L[jj, ii] = 0
+#     cuda.syncthreads()
+
+#     for jj in range(n):
+#         __tmp = math.sqrt(A[jj, jj] - L[jj, jj])
+#         if cuda.threadIdx.x == 0:
+#             L[jj, jj] = __tmp
+#         __tmp = 1.0 / __tmp
+#         for ii in block_range_part(jj+1, n):
+#             __sum = 0.0
+#             for kk in range(jj):
+#                 __sum += L[ii, kk] * L[jj, kk]
+#             __val = (__tmp * (A[ii, jj] - __sum))
+#             L[ii, jj] = __val
+#             L[ii, ii] += __val*__val
+#         cuda.syncthreads()
+
+#     if cuda.threadIdx.x == 0:
+#         for i in range(n):
+#             x[i] = b[i]
+#             for j in range(i):
+#                 x[i] -= L[i, j] * x[j]
+#             x[i] /= L[i, i]
+#         for i in range(n - 1, -1, -1):
+#             for j in range(i + 1, n):
+#                 x[i] -= L[j, i] * x[j]
+#             x[i] /= L[i, i]
+#     cuda.syncthreads()
+
+
 @cuda.jit(device=True, inline=True)
 def cg(A, b, x,
        r, p, Ap,
@@ -212,7 +277,7 @@ def cg(A, b, x,
     for ii in block_range(n):
         r[ii] = b[ii]
         for jj in range(n):
-            r[ii] -= A[jj, ii] * x[jj]
+            r[ii] -= A[ii, jj] * x[jj]
         r[ii] = safe_divide(r[ii], A[ii, ii])
     cuda.syncthreads()
 
@@ -229,7 +294,7 @@ def cg(A, b, x,
         for ii in block_range(n):
             Ap[ii] = 0
             for jj in range(n):
-                Ap[ii] += A[jj, ii] * p[jj]
+                Ap[ii] += A[ii, jj] * p[jj]
         cuda.syncthreads()
 
         # alpha = rs_old / np.dot(p.T, Ap)
@@ -292,6 +357,9 @@ def block_range(__stop):
     '''
     return range(cuda.threadIdx.x, __stop, cuda.blockDim.x)
 
+# @cuda.jit(device=True, inline=True)
+# def block_range_part(__start, __stop):
+#     return range(__start+cuda.threadIdx.x, __stop, cuda.blockDim.x)
 
 def find_analytic_center(A, b, x0):
     """Find the analytic center using scipy.optimize.minimize"""
@@ -333,6 +401,8 @@ def init_point(Q, A, b, x0):
 
     return y0, l0
 
+def gen_lt_idx(n):
+    return np.vstack(np.tril_indices(n)).T
 
 def fit(self, data):
     m, n = self.fitter._reg.shape
@@ -379,12 +449,13 @@ def fit(self, data):
 
     data = cuda.to_device(data)
     coeff = cuda.to_device(coeff)
+    lt_ifx = cuda.to_device(gen_lt_idx(n))
 
     parallel_qp_fit[
-        # (10, 10, 10), 64,
+    #    (2, 2, 2), 64,
         data.shape[:3], 64,
         0, 0](
-            Rt, R_pinv, Q, A, b, x0, y0, l0, data, coeff,
+            Rt, R_pinv, Q, A, b, x0, y0, l0, data, coeff, lt_ifx, 
             c, y, l, dx, dy, dl, rhs1, rhs2, Z, schur, cgr, cgp, cgAp)
 
     cuda.current_context().synchronize()
